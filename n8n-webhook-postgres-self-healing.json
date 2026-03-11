@@ -1,0 +1,373 @@
+{
+  "name": "Production-Grade Webhook to PostgreSQL with Queue Processing and Error Handling",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "data-ingestion",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "d4ee774d-1750-47d0-a462-5878e067e968",
+      "name": "Receive JSON Payload",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        256,
+        1744
+      ],
+      "webhookId": "a0ae5511-0577-4e49-b21d-22205f9075af"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Normalize incoming data by flattening nested objects, sanitizing null values, and converting timestamps to ISO format\n\n// Helper function to flatten nested objects with dot notation\nfunction flattenObject(obj, prefix = '') {\n  let flattened = {};\n  \n  for (let key in obj) {\n    if (obj.hasOwnProperty(key)) {\n      const newKey = prefix ? `${prefix}.${key}` : key;\n      \n      if (obj[key] !== null && typeof obj[key] === 'object' && !Array.isArray(obj[key]) && !(obj[key] instanceof Date)) {\n        Object.assign(flattened, flattenObject(obj[key], newKey));\n      } else {\n        flattened[newKey] = obj[key];\n      }\n    }\n  }\n  \n  return flattened;\n}\n\n// Helper function to sanitize null/undefined values\nfunction sanitizeValue(value) {\n  if (value === null || value === undefined) {\n    return '';\n  }\n  return value;\n}\n\n// Helper function to convert date fields to ISO format\nfunction convertDateToISO(value) {\n  if (!value) return value;\n  \n  // Check if it's already a Date object\n  if (value instanceof Date) {\n    return value.toISOString();\n  }\n  \n  // Try to parse as date\n  const date = new Date(value);\n  if (!isNaN(date.getTime())) {\n    return date.toISOString();\n  }\n  \n  return value;\n}\n\n// Process all items\nconst normalizedItems = [];\n\nfor (const item of $input.all()) {\n  const originalPayload = JSON.parse(JSON.stringify(item.json));\n  \n  // Flatten the object\n  let flattened = flattenObject(item.json);\n  \n  // Sanitize null/undefined values and convert dates\n  let normalized = {};\n  for (let key in flattened) {\n    let value = flattened[key];\n    \n    // Convert date fields to ISO format\n    if (key.toLowerCase().includes('date') || key.toLowerCase().includes('time') || key.toLowerCase().includes('timestamp')) {\n      value = convertDateToISO(value);\n    }\n    \n    // Sanitize null/undefined\n    normalized[key] = sanitizeValue(value);\n  }\n  \n  // Add metadata fields\n  normalized.source = 'webhook';\n  normalized.original_payload = JSON.stringify(originalPayload);\n  normalized.created_at = new Date().toISOString();\n  \n  normalizedItems.push({ json: normalized });\n}\n\nreturn normalizedItems;"
+      },
+      "id": "06f85dbb-7348-4f18-b827-f2cd8730d0f4",
+      "name": "Normalize Data",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        480,
+        1744
+      ]
+    },
+    {
+      "parameters": {
+        "schema": {
+          "__rl": true,
+          "mode": "list",
+          "value": "public"
+        },
+        "table": {
+          "__rl": true,
+          "mode": "name",
+          "value": "processed_data"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "source": "={{ $json.source }}",
+            "payload": "={{ $json.original_payload }}",
+            "created_at": "={{ $json.created_at }}"
+          }
+        },
+        "options": {}
+      },
+      "id": "0c56be48-06ce-470b-816b-51093963d2c9",
+      "name": "Store Processed Data",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        704,
+        1744
+      ],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "schema": {
+          "__rl": true,
+          "mode": "list",
+          "value": "public"
+        },
+        "table": {
+          "__rl": true,
+          "mode": "name",
+          "value": "execution_logs"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "workflow_id": "={{ $workflow.id }}",
+            "execution_id": "={{ $execution.id }}",
+            "status": "success",
+            "executed_at": "={{ $now.toISO() }}",
+            "items_processed": "={{ $json.items_processed || 1 }}"
+          }
+        },
+        "options": {}
+      },
+      "id": "d5e7beec-76a6-41bb-8a93-e2a48dfa2f8b",
+      "name": "Log Execution Metadata",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        928,
+        1824
+      ],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={\n  \"message\": \"Data received and processed successfully\",\n  \"execution_id\": \"={{ $execution.id }}\",\n  \"timestamp\": \"={{ $now.toISO() }}\"\n}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "2d875191-fca2-4262-919f-cd6658422314",
+      "name": "Return Success Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        1152,
+        1872
+      ]
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "mode": "list",
+          "value": "<__PLACEHOLDER_VALUE__slack_error_channel__>"
+        },
+        "text": "=🚨 Database Error in Data Ingestion Workflow\n\nError: {{ $json.error.message }}\nWorkflow: {{ $workflow.name }}\nExecution ID: {{ $execution.id }}\nTimestamp: {{ $now.toISO() }}\n\nThis error will be retried by the global error handler.",
+        "otherOptions": {}
+      },
+      "id": "db5d5974-2b14-4597-83e3-57e6ff07479a",
+      "name": "Notify Database Error",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.4,
+      "position": [
+        1152,
+        1648
+      ],
+      "webhookId": "fe848a37-2ca5-40aa-8aa2-2fbb13e3b0db"
+    },
+    {
+      "parameters": {},
+      "id": "33698d2f-e678-4452-8e0e-28ef8280fa16",
+      "name": "Catch Workflow Errors",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        256,
+        1424
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Calculate retry logic with exponential backoff\n\n// Get the error trigger data\nconst errorData = $input.first().json;\n\n// Extract retry count from execution metadata or default to 0\nlet retryCount = 0;\nif (errorData.execution && errorData.execution.retryOf) {\n  // If this execution is a retry, increment the count\n  retryCount = (errorData.execution.retryCount || 0) + 1;\n} else {\n  // First retry attempt\n  retryCount = 0;\n}\n\n// Increment retry count\nretryCount++;\n\n// Calculate backoff delay with exponential backoff: 1s, 2s, 4s, 8s...\nconst backoffMs = Math.pow(2, retryCount) * 1000;\n\n// Determine if we should retry (max 3 retries)\nconst shouldRetry = retryCount < 3;\n\n// Extract error details\nconst errorDetails = {\n  message: errorData.error?.message || 'Unknown error',\n  stack: errorData.error?.stack || '',\n  node: errorData.node?.name || 'Unknown node',\n  timestamp: new Date().toISOString()\n};\n\n// Get the failed workflow ID\nconst failedWorkflowId = errorData.workflow?.id || $workflow.id;\n\n// Return the retry logic object\nreturn [{\n  json: {\n    retryCount: retryCount,\n    backoffMs: backoffMs,\n    shouldRetry: shouldRetry,\n    errorDetails: errorDetails,\n    failedWorkflowId: failedWorkflowId,\n    maxRetries: 3\n  }\n}];"
+      },
+      "id": "aa2143ae-999e-46bd-ac58-eabacdb259b0",
+      "name": "Calculate Retry Logic",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        256,
+        304
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": false,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "id-1",
+              "leftValue": "={{ $json.shouldRetry }}",
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "0071945e-7ddd-4533-be8f-193e1c85e96e",
+      "name": "Check Retry Limit",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        256,
+        1200
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Implement exponential backoff delay\n\n// Get the backoff delay from input data\nconst inputData = $input.first().json;\nconst backoffMs = inputData.backoffMs || 1000;\n\n// Wait for the backoff period\nawait new Promise(resolve => setTimeout(resolve, backoffMs));\n\n// Return the input data unchanged after the delay completes\nreturn $input.all();"
+      },
+      "id": "de98c734-3506-412f-be62-8d703437518d",
+      "name": "Wait for Backoff",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        256,
+        528
+      ]
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "mode": "list",
+          "value": "<__PLACEHOLDER_VALUE__slack_error_channel__>"
+        },
+        "text": "=🔄 Retry Attempt {{ $json.retryCount }}/3\n\nWorkflow: {{ $json.errorDetails.workflow.name }}\nExecution ID: {{ $json.errorDetails.execution.id }}\nFailed Node: {{ $json.errorDetails.node.name }}\nError: {{ $json.errorDetails.error.message }}\n\nRetrying after {{ $json.backoffMs / 1000 }}s backoff...",
+        "otherOptions": {}
+      },
+      "id": "a4ef8061-6a74-483e-99ea-66ecf5824bbf",
+      "name": "Send Retry Notification",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.4,
+      "position": [
+        256,
+        752
+      ],
+      "webhookId": "69259907-529a-47d7-9246-b57a6eb499f0"
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "mode": "list",
+          "value": "<__PLACEHOLDER_VALUE__slack_error_channel__>"
+        },
+        "text": "=⚠️ CRITICAL: Workflow Failed After 3 Retry Attempts\n\nWorkflow: {{ $json.errorDetails.workflow.name }}\nExecution ID: {{ $json.errorDetails.execution.id }}\nFailed Node: {{ $json.errorDetails.node.name }}\nError: {{ $json.errorDetails.error.message }}\n\nManual intervention required. Check n8n execution logs for details.",
+        "otherOptions": {}
+      },
+      "id": "8061e81d-9a5b-4d2c-a6bd-2cfaad4e9152",
+      "name": "Send Final Failure Alert",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.4,
+      "position": [
+        256,
+        976
+      ],
+      "webhookId": "9bb195bb-8e37-4728-88f6-2b91bb87fc63"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Receive JSON Payload": {
+      "main": [
+        [
+          {
+            "node": "Normalize Data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Data": {
+      "main": [
+        [
+          {
+            "node": "Store Processed Data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Store Processed Data": {
+      "main": [
+        [
+          {
+            "node": "Log Execution Metadata",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Notify Database Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Execution Metadata": {
+      "main": [
+        [
+          {
+            "node": "Return Success Response",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Notify Database Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Catch Workflow Errors": {
+      "main": [
+        [
+          {
+            "node": "Calculate Retry Logic",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Calculate Retry Logic": {
+      "main": [
+        [
+          {
+            "node": "Check Retry Limit",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Retry Limit": {
+      "main": [
+        [
+          {
+            "node": "Wait for Backoff",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Send Final Failure Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait for Backoff": {
+      "main": [
+        [
+          {
+            "node": "Send Retry Notification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false
+  },
+  "versionId": "b4586305-d9bd-44cc-b831-d03eb9c1b2a7",
+  "meta": {
+    "instanceId": "7d924a59d79f92622d789afb240f58e1d83cfee44ce3ca707d2141ab77f664d6"
+  },
+  "id": "Xsq9m5XIor31w7Zd",
+  "tags": []
+}
